@@ -1,333 +1,273 @@
-import pygame
+import streamlit as st
+import folium
+from streamlit_folium import st_folium
+import pandas as pd
 import numpy as np
-import random
-import math
-import os
-from pathlib import Path
+from datetime import datetime, timedelta
+import geopandas as gpd
 import json
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-from matplotlib.colors import LinearSegmentedColormap
-import networkx as nx
+import branca.colormap as cm
+import random
 
-# Constants
-WIDTH, HEIGHT = 800, 600
-FPS = 30
-BACKGROUND_COLOR = (10, 10, 30)
-PARTICLE_SIZES = {"susceptible": 3, "infected": 5, "recovered": 4}
-PARTICLE_COLORS = {
-    "susceptible": (100, 200, 255, 180),  # Blue with alpha
-    "infected": (255, 50, 50, 220),       # Red with alpha
-    "recovered": (100, 255, 100, 180)     # Green with alpha
+# Set page config
+st.set_page_config(layout="wide", page_title="Pakistan Virus Spread Simulator")
+
+# App title
+st.title("Interactive Virus Spread Simulator - Pakistan")
+
+# Sidebar for simulation parameters
+st.sidebar.header("Simulation Parameters")
+
+# Parameter inputs
+initial_infections = st.sidebar.slider("Initial infection centers", 1, 10, 3)
+r_value = st.sidebar.slider("R value (infection rate)", 0.5, 5.0, 2.5)
+recovery_days = st.sidebar.slider("Days to recovery", 7, 21, 14)
+simulation_days = st.sidebar.slider("Simulation duration (days)", 10, 120, 60)
+mobility_factor = st.sidebar.slider("Population mobility", 0.1, 1.0, 0.5)
+intervention_day = st.sidebar.slider("Day to start interventions", 0, 60, 30)
+intervention_strength = st.sidebar.slider("Intervention strength", 0.0, 1.0, 0.5)
+
+# Pakistan major cities with coordinates and population estimates
+pakistan_cities = {
+    "Karachi": {"lat": 24.8607, "lon": 67.0011, "population": 14910000},
+    "Lahore": {"lat": 31.5204, "lon": 74.3587, "population": 11126000},
+    "Faisalabad": {"lat": 31.4504, "lon": 73.1350, "population": 3204000},
+    "Rawalpindi": {"lat": 33.6007, "lon": 73.0679, "population": 2098000},
+    "Multan": {"lat": 30.1798, "lon": 71.4214, "population": 1871000},
+    "Hyderabad": {"lat": 25.3960, "lon": 68.3578, "population": 1734000},
+    "Islamabad": {"lat": 33.6844, "lon": 73.0479, "population": 1095000},
+    "Peshawar": {"lat": 34.0150, "lon": 71.5805, "population": 1970000},
+    "Quetta": {"lat": 30.1798, "lon": 66.9750, "population": 1001000},
+    "Sialkot": {"lat": 32.4945, "lon": 74.5229, "population": 655000}
 }
 
-# Simulation parameters
-NUM_NODES = 200
-INITIAL_INFECTED = 5
-INFECTION_RADIUS = 1.5
-INFECTION_PROB = 0.02
-RECOVERY_DAYS = 14
-MOVEMENT_SPEED = 0.5
-CLUSTER_FACTOR = 0.5  # How strongly nodes are attracted to population centers
-
-class Node:
-    def __init__(self, x, y, health="susceptible"):
-        self.x = x
-        self.y = y
-        self.health = health
-        self.days_infected = 0
-        self.vel_x = random.uniform(-0.5, 0.5)
-        self.vel_y = random.uniform(-0.5, 0.5)
-        self.home_x = x
-        self.home_y = y
-        self.cluster_id = random.randint(0, 4)  # Assign to a random cluster
+# Simulation function
+def run_virus_simulation(initial_cities, r_value, recovery_days, simulation_days, mobility, intervention_day, intervention_strength):
+    # Initialize data structures
+    cities_data = {}
+    for city, data in pakistan_cities.items():
+        # Initially everyone is susceptible
+        susceptible = data["population"]
+        infected = 0
+        recovered = 0
         
-    def move(self, centers):
-        # Random movement
-        self.vel_x += random.uniform(-0.1, 0.1)
-        self.vel_y += random.uniform(-0.1, 0.1)
-        
-        # Limit velocity
-        max_vel = 1.0
-        vel_magnitude = math.sqrt(self.vel_x**2 + self.vel_y**2)
-        if vel_magnitude > max_vel:
-            self.vel_x = (self.vel_x / vel_magnitude) * max_vel
-            self.vel_y = (self.vel_y / vel_magnitude) * max_vel
-        
-        # Attraction to home/cluster
-        center_x, center_y = centers[self.cluster_id]
-        dx = center_x - self.x
-        dy = center_y - self.y
-        dist = max(1, math.sqrt(dx**2 + dy**2))
-        
-        # Stronger attraction when far from center
-        attraction = min(1.0, dist / 200) * CLUSTER_FACTOR
-        self.vel_x += (dx / dist) * attraction
-        self.vel_y += (dy / dist) * attraction
-        
-        # Update position
-        self.x += self.vel_x * MOVEMENT_SPEED
-        self.y += self.vel_y * MOVEMENT_SPEED
-        
-        # Boundary check
-        padding = 20
-        if self.x < padding: 
-            self.x = padding
-            self.vel_x *= -0.5
-        elif self.x > WIDTH - padding: 
-            self.x = WIDTH - padding
-            self.vel_x *= -0.5
-        if self.y < padding: 
-            self.y = padding
-            self.vel_y *= -0.5
-        elif self.y > HEIGHT - padding: 
-            self.y = HEIGHT - padding
-            self.vel_y *= -0.5
-
-class Simulation:
-    def __init__(self):
-        pygame.init()
-        self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
-        pygame.display.set_caption("COVID-19 Spread Simulation - Islamabad")
-        self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("Arial", 20)
-        self.small_font = pygame.font.SysFont("Arial", 16)
-        
-        # Load background image
-        self.bg_image = self.load_background(r"C:\Users\Ali\Desktop\DAA\VirusSpreadSimulator\src\islamabad.png")        
-        
-        # Create population centers (clusters)
-        self.population_centers = [
-            (400, 200),   # North area
-            (700, 350),   # East area
-            (300, 600),   # South-West area
-            (800, 550),   # South-East area
-            (550, 400),   # Central area
-        ]
-        
-        # Initialize nodes
-        self.nodes = []
-        self.initialize_nodes()
-        
-        # Statistics
-        self.day = 0
-        self.stats = {
-            "susceptible": [NUM_NODES - INITIAL_INFECTED],
-            "infected": [INITIAL_INFECTED],
-            "recovered": [0],
-            "days": []
+        # Set initial infections
+        if city in initial_cities:
+            initial_infected = random.randint(10, 100)  # Random number of initial cases
+            infected = initial_infected
+            susceptible -= initial_infected
+            
+        cities_data[city] = {
+            "lat": data["lat"],
+            "lon": data["lon"],
+            "population": data["population"],
+            "timeline": [{
+                "day": 0,
+                "susceptible": susceptible,
+                "infected": infected,
+                "recovered": recovered,
+                "daily_new_cases": infected if infected > 0 else 0
+            }]
         }
-        
-        # Heatmap surface
-        self.heatmap = None
-        self.update_heatmap()
-        
-    def load_background(self, image_path):
-        # Load the image and scale it to the screen size
-        img = pygame.image.load(image_path)
-        img = pygame.transform.scale(img, (WIDTH, HEIGHT))
-        return img
-
-    def initialize_nodes(self):
-        for i in range(NUM_NODES):
-            # Distribute nodes around population centers
-            cluster = random.randint(0, len(self.population_centers) - 1)
-            center_x, center_y = self.population_centers[cluster]
-            
-            # Random position with Gaussian distribution around center
-            x = min(max(20, int(np.random.normal(center_x, 150))), WIDTH-20)
-            y = min(max(20, int(np.random.normal(center_y, 150))), HEIGHT-20)
-            
-            node = Node(x, y)
-            node.cluster_id = cluster
-            self.nodes.append(node)
-        
-        # Initialize infected nodes
-        for i in random.sample(range(NUM_NODES), INITIAL_INFECTED):
-            self.nodes[i].health = "infected"
     
-    def update_heatmap(self):
-        # Create a heatmap of infections
-        heatmap = np.zeros((HEIGHT, WIDTH))
+    # Run simulation for each day
+    for day in range(1, simulation_days + 1):
+        # Apply intervention effect if past intervention day
+        current_r = r_value
+        if day >= intervention_day:
+            current_r = r_value * (1 - intervention_strength)
         
-        for node in self.nodes:
-            if node.health == "infected":
-                # Add heat around each infected node with Gaussian distribution
-                x, y = int(node.x), int(node.y)
-                if 0 <= x < WIDTH and 0 <= y < HEIGHT:
-                    # Intensity based on days infected (more visible in early days)
-                    intensity = max(0.5, 1 - (node.days_infected / RECOVERY_DAYS))
-                    
-                    # Use a smaller radius for the heatmap effect
-                    radius = int(INFECTION_RADIUS * 2)
-                    for dx in range(-radius, radius+1):
-                        for dy in range(-radius, radius+1):
-                            nx, ny = x + dx, y + dy
-                            if 0 <= nx < WIDTH and 0 <= ny < HEIGHT:
-                                dist = math.sqrt(dx**2 + dy**2)
-                                if dist <= radius:
-                                    # Gaussian falloff
-                                    value = intensity * math.exp(-0.1 * dist**2)
-                                    heatmap[ny, nx] += value
-        
-        # Normalize and create surface
-        if np.max(heatmap) > 0:
-            heatmap = heatmap / np.max(heatmap)
-        
-        # Convert heatmap to surface
-        heatmap_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        
-        # Custom colormap for infections (white/red gradient)
-        for y in range(HEIGHT):
-            for x in range(WIDTH):
-                val = heatmap[y, x]
-                if val > 0.05:  # Threshold to only show significant areas
-                    alpha = int(min(180, val * 220))
-                    color = (255, int(255 * (1 - val)), int(255 * (1 - val)), alpha)
-                    heatmap_surface.set_at((x, y), color)
-        
-        self.heatmap = heatmap_surface
+        # Calculate new infections and recoveries for each city
+        for city, data in cities_data.items():
+            yesterday = data["timeline"][-1]
+            
+            # Natural recoveries
+            new_recovered = int(yesterday["infected"] / recovery_days)
+            
+            # New infections from within the city
+            new_infected_local = int(yesterday["infected"] * current_r * (yesterday["susceptible"] / data["population"]))
+            
+            # Infections from other cities (mobility factor)
+            new_infected_travelers = 0
+            if mobility > 0:
+                for other_city, other_data in cities_data.items():
+                    if other_city != city:
+                        other_yesterday = other_data["timeline"][-1]
+                        # Calculate based on distance and infected population
+                        infected_ratio = other_yesterday["infected"] / other_data["population"]
+                        # Simple model for travel-based infections
+                        new_infected_travelers += int(infected_ratio * mobility * 10)  # Simplified model
+            
+            total_new_infected = min(yesterday["susceptible"], new_infected_local + new_infected_travelers)
+            
+            # Update counts
+            infected = yesterday["infected"] + total_new_infected - new_recovered
+            susceptible = yesterday["susceptible"] - total_new_infected
+            recovered = yesterday["recovered"] + new_recovered
+            
+            # Ensure non-negative values
+            infected = max(0, infected)
+            susceptible = max(0, susceptible)
+            recovered = max(0, recovered)
+            
+            # Store daily data
+            data["timeline"].append({
+                "day": day,
+                "susceptible": susceptible,
+                "infected": infected,
+                "recovered": recovered,
+                "daily_new_cases": total_new_infected
+            })
     
-    def spread_disease(self):
-        self.day += 1
-        new_infections = 0
-        new_recoveries = 0
-        
-        # Update nodes and check for infections
-        infected_nodes = [n for n in self.nodes if n.health == "infected"]
-        susceptible_nodes = [n for n in self.nodes if n.health == "susceptible"]
-        
-        # Recovery phase
-        for node in infected_nodes:
-            node.days_infected += 1
-            if node.days_infected >= RECOVERY_DAYS:
-                node.health = "recovered"
-                new_recoveries += 1
-        
-        # Infection phase - optimized to avoid checking all pairs
-        for s_node in susceptible_nodes:
-            for i_node in infected_nodes:
-                dist = math.sqrt((s_node.x - i_node.x)**2 + (s_node.y - i_node.y)**2)
-                if dist < INFECTION_RADIUS and random.random() < INFECTION_PROB:
-                    s_node.health = "infected"
-                    new_infections += 1
-                    break  # Node already infected, no need to check other infected nodes
-        
-        # Update statistics
-        self.stats["days"].append(self.day)
-        self.stats["susceptible"].append(self.stats["susceptible"][-1] - new_infections)
-        self.stats["infected"].append(self.stats["infected"][-1] + new_infections - new_recoveries)
-        self.stats["recovered"].append(self.stats["recovered"][-1] + new_recoveries)
-        
-        # Update heatmap every few days to improve performance
-        if self.day % 2 == 0:
-            self.update_heatmap()
-        
-        return new_infections
+    return cities_data
 
-    def run(self):
-        running = True
-        paused = False
-        show_heatmap = True
-        show_particles = True
+# Create map function
+def create_pakistan_map(cities_data, selected_day):
+    # Create map centered on Pakistan
+    m = folium.Map(location=[30.3753, 69.3451], zoom_start=6)
+    
+    # Create color scale for infection levels
+    max_infections = 0
+    for city, data in cities_data.items():
+        city_infections = data["timeline"][selected_day]["infected"]
+        if city_infections > max_infections:
+            max_infections = city_infections
+    
+    # Create color map based on infection rates
+    colormap = cm.LinearColormap(
+        colors=['green', 'yellow', 'orange', 'red'], 
+        vmin=0, 
+        vmax=max_infections
+    )
+    
+    # Add markers for cities
+    for city, data in cities_data.items():
+        day_data = data["timeline"][selected_day]
+        infected_ratio = day_data["infected"] / data["population"]
+        infected_percent = infected_ratio * 100
         
-        while running:
-            # Process events
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-                elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_SPACE:
-                        paused = not paused
-                    elif event.key == pygame.K_h:
-                        show_heatmap = not show_heatmap
-                    elif event.key == pygame.K_p:
-                        show_particles = not show_particles
-                    elif event.key == pygame.K_ESCAPE:
-                        running = False
-            
-            # Update simulation if not paused
-            if not paused:
-                # Move nodes
-                for node in self.nodes:
-                    node.move(self.population_centers)
-                
-                # Run disease spread
-                new_infections = self.spread_disease()
-                
-                # Check if simulation is complete (no more infections)
-                if self.stats["infected"][-1] == 0:
-                    paused = True
-            
-            # Draw everything
-            self.screen.blit(self.bg_image, (0, 0))
-            
-            # Draw heatmap
-            if show_heatmap and self.heatmap:
-                self.screen.blit(self.heatmap, (0, 0))
-            
-            # Draw population centers
-            for i, (cx, cy) in enumerate(self.population_centers):
-                pygame.draw.circle(self.screen, (60, 60, 90, 120), (cx, cy), 20, 2)
-                name = f"District {i+1}"
-                text = self.small_font.render(name, True, (180, 180, 200))
-                self.screen.blit(text, (cx - text.get_width()//2, cy - 30))
-            
-            # Draw nodes
-            if show_particles:
-                for node in self.nodes:
-                    size = PARTICLE_SIZES[node.health]
-                    color = PARTICLE_COLORS[node.health]
-                    pygame.draw.circle(self.screen, color, (int(node.x), int(node.y)), size)
-            
-            # Draw statistics
-            stats_bg = pygame.Surface((300, 120), pygame.SRCALPHA)
-            stats_bg.fill((10, 10, 30, 180))
-            self.screen.blit(stats_bg, (10, 10))
-            
-            texts = [
-                f"Day: {self.day}",
-                f"Susceptible: {self.stats['susceptible'][-1]}",
-                f"Infected: {self.stats['infected'][-1]}",
-                f"Recovered: {self.stats['recovered'][-1]}",
-            ]
-            
-            y_offset = 15
-            for text in texts:
-                text_surface = self.font.render(text, True, (220, 220, 220))
-                self.screen.blit(text_surface, (20, y_offset))
-                y_offset += 25
-            
-            # Draw controls
-            controls_text = self.small_font.render(
-                "Controls: SPACE - Pause | H - Toggle Heatmap | P - Toggle Particles | ESC - Quit", 
-                True, (180, 180, 180)
+        # Circle size based on population
+        radius = (data["population"]) ** 0.5 / 50
+        
+        # Color based on infection rate
+        color = colormap(day_data["infected"])
+        
+        # Create popup text
+        popup_text = f"""
+        <strong>{city}</strong><br>
+        Population: {data['population']:,}<br>
+        Infected: {day_data['infected']:,} ({infected_percent:.2f}%)<br>
+        Recovered: {day_data['recovered']:,}<br>
+        New cases today: {day_data['daily_new_cases']:,}
+        """
+        
+        # Add circle
+        folium.Circle(
+            location=[data["lat"], data["lon"]],
+            radius=radius,
+            color=color,
+            fill=True,
+            fill_opacity=0.6,
+            popup=folium.Popup(popup_text, max_width=200)
+        ).add_to(m)
+        
+        # Add city label
+        folium.Marker(
+            location=[data["lat"], data["lon"]],
+            icon=folium.DivIcon(
+                icon_size=(150, 36),
+                icon_anchor=(75, 0),
+                html=f'<div style="font-size: 10pt; color: black; text-align: center;">{city}<br>{day_data["infected"]:,}</div>'
             )
-            self.screen.blit(controls_text, (10, HEIGHT - 30))
-            
-            # Update display
-            pygame.display.flip()
-            self.clock.tick(FPS)
-        
-        pygame.quit()
-        
-        # When simulation ends, generate a plot
-        self.generate_stats_plot()
-        
-    def generate_stats_plot(self):
-        plt.figure(figsize=(10, 6))
-        plt.plot(self.stats["days"], self.stats["susceptible"], label="Susceptible", color="blue")
-        plt.plot(self.stats["days"], self.stats["infected"], label="Infected", color="red")
-        plt.plot(self.stats["days"], self.stats["recovered"], label="Recovered", color="green")
-        plt.xlabel("Days")
-        plt.ylabel("Population")
-        plt.title(f"Disease Spread in Islamabad (N={NUM_NODES})")
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig("disease_simulation_results.png")
-        print("Statistics plot saved as disease_simulation_results.png")
+        ).add_to(m)
+    
+    # Add a legend
+    colormap.caption = "Number of Active Infections"
+    colormap.add_to(m)
+    
+    return m
 
-if __name__ == "__main__":
-    sim = Simulation()
-    sim.run()
+# Run simulation button
+if st.sidebar.button("Run Simulation"):
+    # Select initial infection cities randomly
+    initial_cities = random.sample(list(pakistan_cities.keys()), initial_infections)
+    st.sidebar.write("Initial infection cities:", ", ".join(initial_cities))
+    
+    # Run simulation
+    simulation_data = run_virus_simulation(
+        initial_cities,
+        r_value,
+        recovery_days,
+        simulation_days,
+        mobility_factor,
+        intervention_day,
+        intervention_strength
+    )
+    
+    # Cache simulation data in session state
+    st.session_state.simulation_data = simulation_data
+    st.session_state.simulation_run = True
+
+# Display map if simulation has been run
+if 'simulation_run' in st.session_state and st.session_state.simulation_run:
+    # Create two columns for map and statistics
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        # Day selector
+        selected_day = st.slider("Simulation Day", 0, simulation_days, 0)
+        
+        # Create map
+        map_data = create_pakistan_map(st.session_state.simulation_data, selected_day)
+        
+        # Render the map
+        st_folium(map_data, width=800, height=600)
+    
+    with col2:
+        # Display statistics
+        st.subheader(f"Day {selected_day} Statistics")
+        
+        # Calculate totals
+        total_infected = 0
+        total_recovered = 0
+        total_susceptible = 0
+        total_new_cases = 0
+        
+        for city, data in st.session_state.simulation_data.items():
+            day_data = data["timeline"][selected_day]
+            total_infected += day_data["infected"]
+            total_recovered += day_data["recovered"]
+            total_susceptible += day_data["susceptible"]
+            total_new_cases += day_data["daily_new_cases"]
+        
+        # Display summary statistics
+        st.metric("Total Infected", f"{total_infected:,}")
+        st.metric("New Cases Today", f"{total_new_cases:,}")
+        st.metric("Total Recovered", f"{total_recovered:,}")
+        
+        # Show intervention status
+        if selected_day >= intervention_day:
+            st.info(f"Interventions active (reducing R by {intervention_strength*100:.0f}%)")
+        else:
+            st.warning(f"No interventions yet (starting day {intervention_day})")
+        
+        # Show top 3 most infected cities
+        st.subheader("Most affected cities:")
+        city_infections = []
+        for city, data in st.session_state.simulation_data.items():
+            day_data = data["timeline"][selected_day]
+            city_infections.append((city, day_data["infected"], day_data["infected"]/data["population"]*100))
+        
+        # Sort by number of infections
+        city_infections.sort(key=lambda x: x[1], reverse=True)
+        
+        # Display top 3
+        for i, (city, infected, percentage) in enumerate(city_infections[:3]):
+            st.write(f"{i+1}. {city}: {infected:,} cases ({percentage:.2f}%)")
+else:
+    # Instructions if simulation hasn't been run
+    st.write("### Instructions")
+    st.write("1. Adjust the simulation parameters in the sidebar")
+    st.write("2. Click 'Run Simulation' to start")
+    st.write("3. Use the day slider to see how the virus spreads over time")
+    st.write("4. Click on city circles for detailed information")
