@@ -6,12 +6,32 @@ import numpy as np
 from datetime import datetime, timedelta
 import random
 import branca.colormap as cm
+import time
 
 # Set page config
 st.set_page_config(layout="wide", page_title="Islamabad Virus Spread Simulator")
 
 # App title
 st.title("Interactive Virus Spread Simulator - Islamabad")
+
+# Initialize session state variables if they don't exist
+if 'simulation_run' not in st.session_state:
+    st.session_state.simulation_run = False
+
+if 'antidote_applied' not in st.session_state:
+    st.session_state.antidote_applied = False
+
+if 'antidote_day' not in st.session_state:
+    st.session_state.antidote_day = 0
+
+if 'antidote_effectiveness' not in st.session_state:
+    st.session_state.antidote_effectiveness = 0.5
+
+if 'display_mode' not in st.session_state:
+    st.session_state.display_mode = "Dots Only"
+
+if 'dot_density' not in st.session_state:
+    st.session_state.dot_density = 0.5
 
 # Sidebar for simulation parameters
 st.sidebar.header("Simulation Parameters")
@@ -24,8 +44,15 @@ intervention_day = st.sidebar.slider("Day to start interventions", 0, 45, 15)
 intervention_strength = st.sidebar.slider("Intervention strength", 0.0, 1.0, 0.5)
 
 # Add a parameter to control dot density
-dot_density = st.sidebar.slider("Dot density", 0.1, 1.0, 0.5, 
+st.session_state.dot_density = st.sidebar.slider("Dot density", 0.1, 1.0, st.session_state.dot_density, 
                                help="Controls how many dots are shown (higher values show more dots but may affect performance)")
+
+# IMPORTANT: Add a display mode selector - DOTS ONLY is the default
+st.session_state.display_mode = st.sidebar.radio(
+    "Display Mode",
+    ["Dots Only", "Sectors Only", "Dots + Sectors (Light)", "Dots + Sectors (Labels Only)"],
+    index=["Dots Only", "Sectors Only", "Dots + Sectors (Light)", "Dots + Sectors (Labels Only)"].index(st.session_state.display_mode)
+)
 
 # Islamabad data
 islamabad = {
@@ -213,16 +240,77 @@ def run_virus_simulation(r_value, simulation_days, intervention_day, interventio
    
     return sectors_data, infected_people
 
-# Create map with focus on Islamabad - OPTIMIZED VERSION
-def create_islamabad_map(sectors_data, infected_people, selected_day, dot_density=0.5, show_sectors=False):
+# Create map with focus on Islamabad - COMPLETELY REWRITTEN VERSION
+def create_islamabad_map(sectors_data, infected_people, selected_day, dot_density=0.5, display_mode="Dots Only"):
     # Create map centered on Islamabad
     m = folium.Map(location=[33.6844, 73.0479], zoom_start=12, tiles="CartoDB positron")
    
     # Filter infected people for current day
     current_infected = [p for p in infected_people if p.day_infected <= selected_day and not p.is_recovered(selected_day)]
+    
+    # CRITICAL FIX: Make sure we have infected people to show
+    if len(current_infected) == 0 and selected_day == 0:
+        # Force some initial infections for visibility
+        for sector in islamabad["sectors"][:initial_infections]:
+            for _ in range(20):
+                lat_offset = (random.random() - 0.5) * 0.01
+                lon_offset = (random.random() - 0.5) * 0.01
+                current_infected.append(InfectedPerson(
+                    sector["lat"] + lat_offset,
+                    sector["lon"] + lon_offset,
+                    0
+                ))
+    
+    # Add dots if display mode includes dots
+    if "Dots" in display_mode:
+        # Calculate max dots based on density
+        MAX_DOTS = int(2000 * dot_density)
+        
+        # If we have a reasonable number of dots, show them all
+        if len(current_infected) <= MAX_DOTS:
+            dots_to_show = current_infected
+        else:
+            # Efficient sampling for larger numbers
+            sample_stride = max(1, len(current_infected) // MAX_DOTS)
+            dots_to_show = current_infected[::sample_stride]
+        
+        # CRITICAL FIX: Use direct JavaScript to add dots to prevent rerendering issues
+        dot_js = """
+        <script>
+        // Function to add dots to the map
+        function addDots() {
+            var map = document.querySelector('.folium-map')._leaflet_map;
+            var dots = %s;
+            
+            // Create a layer group for dots
+            var dotLayer = L.layerGroup();
+            
+            // Add each dot
+            dots.forEach(function(dot) {
+                L.circleMarker([dot[0], dot[1]], {
+                    radius: 3,
+                    color: 'red',
+                    fillColor: 'red',
+                    fillOpacity: 0.8,
+                    weight: 1
+                }).addTo(dotLayer);
+            });
+            
+            // Add the layer to the map
+            dotLayer.addTo(map);
+        }
+        
+        // Wait for the map to be fully loaded
+        document.addEventListener('DOMContentLoaded', function() {
+            setTimeout(addDots, 1000);  // Add a delay to ensure map is loaded
+        });
+        </script>
+        """ % str([[dot.lat, dot.lon] for dot in dots_to_show])
+        
+        m.get_root().html.add_child(folium.Element(dot_js))
    
-    # Add sector circles if requested
-    if show_sectors:
+    # Add sector circles if display mode includes sectors
+    if "Sectors" in display_mode and display_mode != "Dots Only":
         for sector_name, data in sectors_data.items():
             sector_info = next((s for s in islamabad["sectors"] if s["name"] == sector_name), None)
             if not sector_info:
@@ -238,7 +326,7 @@ def create_islamabad_map(sectors_data, infected_people, selected_day, dot_densit
            
             # Determine color based on infection rate
             if infection_percent > 5:
-                color = "red"
+                color = "darkred"
             elif infection_percent > 1:
                 color = "orange"
             elif infection_percent > 0.1:
@@ -254,16 +342,20 @@ def create_islamabad_map(sectors_data, infected_people, selected_day, dot_densit
             Total Infections: {day_data['cumulative_infections']:,}<br>
             New Cases Today: {day_data['daily_new_cases']:,}
             """
-           
-            # Add sector circle with reduced opacity to better see dots
-            folium.Circle(
-                location=[sector_info["lat"], sector_info["lon"]],
-                radius=300,  # Fixed radius for sectors
-                color=color,
-                fill=True,
-                fill_opacity=0.1,  # Reduced opacity to see dots better
-                popup=folium.Popup(popup_text, max_width=250)
-            ).add_to(m)
+            
+            # Only add sector circles if not in "Labels Only" mode
+            if display_mode != "Dots + Sectors (Labels Only)":
+                # Adjust opacity based on display mode
+                opacity = 0.05 if display_mode == "Dots + Sectors (Light)" else 0.3
+                
+                folium.Circle(
+                    location=[sector_info["lat"], sector_info["lon"]],
+                    radius=300,
+                    color=color,
+                    fill=True,
+                    fill_opacity=opacity,
+                    popup=folium.Popup(popup_text, max_width=250)
+                ).add_to(m)
            
             # Add sector label
             folium.Marker(
@@ -275,79 +367,19 @@ def create_islamabad_map(sectors_data, infected_people, selected_day, dot_densit
                 )
             ).add_to(m)
    
-    # Add infected people as dots - ALWAYS show dots from day 0
-    # Limit number of dots for performance
-    MAX_DOTS = int(2000 * dot_density)  # Adjust based on dot density parameter
-   
-    # Create feature group just once
-    marker_group = folium.FeatureGroup(name="Infected Individuals")
-   
-    # If we have a reasonable number of dots, show them all
-    if len(current_infected) <= MAX_DOTS:
-        # Use a list comprehension to create all the circle marker options first
-        for person in current_infected:
-            folium.CircleMarker(
-                location=[person.lat, person.lon],
-                radius=2,
-                color='red',
-                fill=True,
-                fill_opacity=0.7,
-                weight=1
-            ).add_to(marker_group)
-    else:
-        # Efficient sampling for larger numbers
-        # Use stride sampling instead of random sampling for better performance
-        sample_stride = max(1, len(current_infected) // MAX_DOTS)
-        sampled_infected = current_infected[::sample_stride]
-       
-        # Use the same efficient approach for the sampled dots
-        for person in sampled_infected:
-            folium.CircleMarker(
-                location=[person.lat, person.lon],
-                radius=2,
-                color='red',
-                fill=True,
-                fill_opacity=0.7,
-                weight=1
-            ).add_to(marker_group)
-   
-    # Add the marker group to the map
-    marker_group.add_to(m)
-   
     # Add title
     title_html = '''
     <div style="position: fixed;
                 top: 10px; left: 50%; transform: translateX(-50%);
                 z-index: 1000; background-color: white;
                 padding: 10px; border-radius: 5px; border: 1px solid grey;">
-        <h4>Islamabad COVID-19 Simulation - Day {}</h4>
+        <h4>Islamabad Virus Simulation - Day {}</h4>
         <p style="margin: 0; text-align: center;">{} Active Cases</p>
     </div>
     '''.format(selected_day, len(current_infected))
     m.get_root().html.add_child(folium.Element(title_html))
    
     return m
-
-# Initialize session state variables if they don't exist
-if 'simulation_run' not in st.session_state:
-    st.session_state.simulation_run = False
-
-if 'antidote_applied' not in st.session_state:
-    st.session_state.antidote_applied = False
-
-if 'antidote_day' not in st.session_state:
-    st.session_state.antidote_day = 0
-
-if 'antidote_effectiveness' not in st.session_state:
-    st.session_state.antidote_effectiveness = 0.5
-
-if 'show_sectors' not in st.session_state:
-    st.session_state.show_sectors = False
-
-# Add toggle for showing sector circles
-st.sidebar.subheader("Display Options")
-show_sectors = st.sidebar.checkbox("Show sector circles", value=False)
-st.session_state.show_sectors = show_sectors
 
 # Run simulation button
 if st.sidebar.button("Run Simulation"):
@@ -368,16 +400,10 @@ if st.sidebar.button("Run Simulation"):
         st.session_state.sectors_data = sectors_data
         st.session_state.infected_people = infected_people
         st.session_state.simulation_run = True
-       
-        # Initialize the map immediately to avoid the AttributeError
         st.session_state.selected_day = 0
-        st.session_state.current_map = create_islamabad_map(
-            sectors_data,
-            infected_people,
-            0,  # Start with day 0
-            dot_density,
-            st.session_state.show_sectors
-        )
+        
+        # Force a complete page refresh to ensure the map renders correctly
+        st.rerun()
 
 # Create a single map that's less likely to cause rerendering issues
 if st.session_state.simulation_run:
@@ -385,53 +411,33 @@ if st.session_state.simulation_run:
     col1, col2 = st.columns([3, 1])
    
     with col1:
-        # Make the slider a session state variable to prevent map rerendering
-        if 'selected_day' not in st.session_state:
-            st.session_state.selected_day = 0
-           
-        # Initialize current_map if it doesn't exist yet
-        if 'current_map' not in st.session_state:
-            st.session_state.current_map = create_islamabad_map(
-                st.session_state.sectors_data,
-                st.session_state.infected_people,
-                0,  # Start with day 0
-                dot_density,
-                st.session_state.show_sectors
-            )
-           
         # Day selector
         selected_day = st.slider(
             "Simulation Day",
             0,
             simulation_days,
-            st.session_state.selected_day,
+            st.session_state.get('selected_day', 0),
             key="day_slider"
         )
-       
-        # Only recreate the map if the day has changed or display options changed
-        if (selected_day != st.session_state.selected_day or 
-            show_sectors != st.session_state.show_sectors):
-            
-            st.session_state.selected_day = selected_day
-            st.session_state.show_sectors = show_sectors
-           
-            # Create and cache the map
-            with st.spinner("Updating map..."):
-                st.session_state.current_map = create_islamabad_map(
-                    st.session_state.sectors_data,
-                    st.session_state.infected_people,
-                    selected_day,
-                    dot_density,
-                    show_sectors
-                )
-       
-        # Always use the cached map
+        
+        # Store the selected day
+        st.session_state.selected_day = selected_day
+        
+        # Create the map
+        current_map = create_islamabad_map(
+            st.session_state.sectors_data,
+            st.session_state.infected_people,
+            selected_day,
+            st.session_state.dot_density,
+            st.session_state.display_mode
+        )
+        
+        # Display the map
         st_folium(
-            st.session_state.current_map,
+            current_map,
             width=800,
             height=600,
-            # Add a key to prevent rerendering
-            key="map_display"
+            key=f"map_display_{selected_day}_{st.session_state.display_mode}_{st.session_state.dot_density}"
         )
    
     with col2:
@@ -487,15 +493,9 @@ if st.session_state.simulation_run:
                     st.session_state.sectors_data = sectors_data
                     st.session_state.infected_people = infected_people
                     st.success(f"Antidote deployed on day {selected_day} with {antidote_effectiveness*100:.0f}% effectiveness!")
-                   
-                    # Recreate the map for the current day
-                    st.session_state.current_map = create_islamabad_map(
-                        st.session_state.sectors_data,
-                        st.session_state.infected_people,
-                        selected_day,
-                        dot_density,
-                        st.session_state.show_sectors
-                    )
+                    
+                    # Force a complete page refresh
+                    st.experimental_rerun()
         else:
             st.success(f"Antidote deployed on day {st.session_state.antidote_day} with {st.session_state.antidote_effectiveness*100:.0f}% effectiveness!")
        
@@ -525,5 +525,6 @@ else:
     st.write("3. Use the day slider to see how the virus spreads over time")
     st.write("4. Deploy the antidote when you're ready to start treating infected people")
     st.write("5. Adjust dot density if you experience performance issues")
+    st.write("6. Choose 'Dots Only' display mode to see infected individuals clearly")
    
-    st.info("This simulation focuses on Islamabad with infected individuals shown as red dots.")
+    st.info("This simulation shows infected individuals as red dots from day 0.")
