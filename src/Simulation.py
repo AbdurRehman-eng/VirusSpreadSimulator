@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import random
 import branca.colormap as cm
 import time
+import math
 
 # Set page config
 st.set_page_config(layout="wide", page_title="Islamabad Virus Spread Simulator")
@@ -32,6 +33,22 @@ if 'display_mode' not in st.session_state:
 
 if 'dot_density' not in st.session_state:
     st.session_state.dot_density = 0.5
+
+if 'selected_day' not in st.session_state:
+    st.session_state.selected_day = 0
+
+if 'dot_seed' not in st.session_state:
+    st.session_state.dot_seed = random.randint(1, 10000)  # Create a fixed seed for random dot generation
+
+# Add animation state variables
+if 'is_animating' not in st.session_state:
+    st.session_state.is_animating = False
+
+if 'animation_speed' not in st.session_state:
+    st.session_state.animation_speed = 2.0  # seconds between frames (slower default)
+
+if 'animation_last_update' not in st.session_state:
+    st.session_state.animation_last_update = time.time()
 
 # Sidebar for simulation parameters
 st.sidebar.header("Simulation Parameters")
@@ -96,7 +113,7 @@ def run_virus_simulation(r_value, simulation_days, intervention_day, interventio
     # Initialize data structures
     sectors_data = {}
     infected_people = []
-   
+    
     # Setup initial data for each sector
     for sector in islamabad["sectors"]:
         sectors_data[sector["name"]] = {
@@ -238,31 +255,132 @@ def run_virus_simulation(r_value, simulation_days, intervention_day, interventio
                 "daily_new_cases": daily_new if daily_new >= 0 else 0
             })
    
+    # Store both daily infected person data and totals
     return sectors_data, infected_people
 
-# Create map with focus on Islamabad - COMPLETELY REWRITTEN VERSION
+# First fix the rerun issue by replacing experimental_rerun
+if 'map_key' not in st.session_state:
+    st.session_state.map_key = 0
+
 def create_islamabad_map(sectors_data, infected_people, selected_day, dot_density=0.5, display_mode="Dots Only"):
-    # Create map centered on Islamabad
-    m = folium.Map(location=[33.6844, 73.0479], zoom_start=12, tiles="CartoDB positron")
+    # Create map centered on Islamabad with zoom restrictions
+    m = folium.Map(
+        location=[33.6844, 73.0479],
+        zoom_start=12,
+        tiles="CartoDB positron",
+        min_zoom=11,
+        max_zoom=15
+    )
    
-    # Filter infected people for current day
+    # Filter infected people for current day - FIXED THIS FUNCTION
     current_infected = [p for p in infected_people if p.day_infected <= selected_day and not p.is_recovered(selected_day)]
     
-    # CRITICAL FIX: Make sure we have infected people to show
-    if len(current_infected) == 0 and selected_day == 0:
-        # Force some initial infections for visibility
-        for sector in islamabad["sectors"][:initial_infections]:
-            for _ in range(20):
-                lat_offset = (random.random() - 0.5) * 0.01
-                lon_offset = (random.random() - 0.5) * 0.01
-                current_infected.append(InfectedPerson(
-                    sector["lat"] + lat_offset,
-                    sector["lon"] + lon_offset,
-                    0
-                ))
+    # Find recovered people for current day
+    current_recovered = [p for p in infected_people if p.day_infected <= selected_day and p.is_recovered(selected_day)]
     
-    # Add dots if display mode includes dots
-    if "Dots" in display_mode:
+    # Use fixed random seed for consistent dot generation
+    # Combine the seed with the day to ensure different days show different patterns
+    # But the same day always shows the same pattern
+    dot_random = random.Random(st.session_state.dot_seed + selected_day)
+    
+    # Handle Dots Only mode - COMPLETELY REWRITTEN
+    if display_mode == "Dots Only":
+        # Get total infected and recovered counts across all sectors
+        total_active = sum(
+            next((d for d in data["timeline"] if d["day"] == selected_day), {"active_infections": 0})["active_infections"] 
+            for data in sectors_data.values()
+        )
+        
+        total_recovered = sum(
+            (next((d for d in data["timeline"] if d["day"] == selected_day), {"cumulative_infections": 0})["cumulative_infections"] -
+             next((d for d in data["timeline"] if d["day"] == selected_day), {"active_infections": 0})["active_infections"])
+            for data in sectors_data.values()
+        )
+        
+        # Only proceed if we have cases to show
+        if total_active > 0 or total_recovered > 0:
+            # Create feature groups for the dots
+            active_dot_group = folium.FeatureGroup(name="Active Infection Dots")
+            recovered_dot_group = folium.FeatureGroup(name="Recovered Dots")
+            
+            # For each sector, create dots
+            for sector_name, data in sectors_data.items():
+                sector_info = next((s for s in islamabad["sectors"] if s["name"] == sector_name), None)
+                if not sector_info:
+                    continue
+                   
+                # Get data for current day
+                day_data = next((d for d in data["timeline"] if d["day"] == selected_day), None)
+                if not day_data:
+                    continue
+                
+                # Find active cases and recovered cases in this sector
+                active_cases = day_data["active_infections"]
+                total_cases = day_data["cumulative_infections"]
+                recovered_cases = total_cases - active_cases
+                
+                # Skip if no cases
+                if active_cases == 0 and recovered_cases == 0:
+                    continue
+                
+                # Calculate radius for dot distribution (bigger than sector radius for better spread)
+                sector_radius = 500
+                
+                # Calculate number of dots to show
+                MAX_DOTS_PER_SECTOR = 200 * dot_density
+                active_dots_to_show = min(active_cases, int(MAX_DOTS_PER_SECTOR))
+                recovered_dots_to_show = min(recovered_cases, int(MAX_DOTS_PER_SECTOR))
+                
+                # Scale down if too many dots
+                if active_cases + recovered_cases > MAX_DOTS_PER_SECTOR * 2:
+                    scale_factor = (MAX_DOTS_PER_SECTOR * 2) / (active_cases + recovered_cases)
+                    active_dots_to_show = int(active_cases * scale_factor)
+                    recovered_dots_to_show = int(recovered_cases * scale_factor)
+                
+                # Generate positions for infected dots within the sector circle - using fixed seed
+                for i in range(active_dots_to_show):
+                    # Generate random point within sector circle - using our seeded random generator
+                    angle = dot_random.uniform(0, 2 * 3.14159)
+                    radius_factor = dot_random.uniform(0, 0.9)  # Stay within 90% of circle radius
+                    offset_lat = radius_factor * sector_radius * 0.000009 * math.cos(angle)  # Convert meters to approx degrees
+                    offset_lon = radius_factor * sector_radius * 0.000015 * math.sin(angle)  # Adjust for latitude
+                    
+                    folium.CircleMarker(
+                        location=[sector_info["lat"] + offset_lat, sector_info["lon"] + offset_lon],
+                        radius=2,  # Slightly larger for better visibility
+                        color='red',
+                        fill=True,
+                        fillColor='red',
+                        fillOpacity=0.8,
+                        weight=1,
+                        popup="Active Infection"
+                    ).add_to(active_dot_group)
+                
+                # Generate positions for recovered dots - using fixed seed
+                for i in range(recovered_dots_to_show):
+                    # Generate random point within sector circle - using our seeded random generator
+                    angle = dot_random.uniform(0, 2 * 3.14159)
+                    radius_factor = dot_random.uniform(0, 0.9)
+                    offset_lat = radius_factor * sector_radius * 0.000009 * math.cos(angle)
+                    offset_lon = radius_factor * sector_radius * 0.000015 * math.sin(angle)
+                    
+                    folium.CircleMarker(
+                        location=[sector_info["lat"] + offset_lat, sector_info["lon"] + offset_lon],
+                        radius=2,
+                        color='green',
+                        fill=True,
+                        fillColor='green',
+                        fillOpacity=0.8,
+                        weight=1,
+                        popup="Recovered Case"
+                    ).add_to(recovered_dot_group)
+            
+            # Add the dot groups to the map
+            active_dot_group.add_to(m)
+            recovered_dot_group.add_to(m)
+    
+    # Handle combined modes with dots - also use the seeded random
+    elif "Dots" in display_mode and "Labels" not in display_mode and len(current_infected) > 0:
         # Calculate max dots based on density
         MAX_DOTS = int(2000 * dot_density)
         
@@ -270,47 +388,33 @@ def create_islamabad_map(sectors_data, infected_people, selected_day, dot_densit
         if len(current_infected) <= MAX_DOTS:
             dots_to_show = current_infected
         else:
-            # Efficient sampling for larger numbers
-            sample_stride = max(1, len(current_infected) // MAX_DOTS)
-            dots_to_show = current_infected[::sample_stride]
+            # Efficient sampling for larger numbers - use seeded random
+            dots_to_show = dot_random.sample(current_infected, MAX_DOTS)
         
-        # CRITICAL FIX: Use direct JavaScript to add dots to prevent rerendering issues
-        dot_js = """
-        <script>
-        // Function to add dots to the map
-        function addDots() {
-            var map = document.querySelector('.folium-map')._leaflet_map;
-            var dots = %s;
-            
-            // Create a layer group for dots
-            var dotLayer = L.layerGroup();
-            
-            // Add each dot
-            dots.forEach(function(dot) {
-                L.circleMarker([dot[0], dot[1]], {
-                    radius: 3,
-                    color: 'red',
-                    fillColor: 'red',
-                    fillOpacity: 0.8,
-                    weight: 1
-                }).addTo(dotLayer);
-            });
-            
-            // Add the layer to the map
-            dotLayer.addTo(map);
-        }
+        # Create a feature group for the dots
+        dot_group = folium.FeatureGroup(name="Infection Dots")
         
-        // Wait for the map to be fully loaded
-        document.addEventListener('DOMContentLoaded', function() {
-            setTimeout(addDots, 1000);  // Add a delay to ensure map is loaded
-        });
-        </script>
-        """ % str([[dot.lat, dot.lon] for dot in dots_to_show])
+        # Add dots to the feature group
+        for dot in dots_to_show:
+            folium.CircleMarker(
+                location=[dot.lat, dot.lon],
+                radius=2,
+                color='red',
+                fill=True,
+                fillColor='red',
+                fillOpacity=0.8,
+                weight=1,
+                popup=f"Infected on day {dot.day_infected}"
+            ).add_to(dot_group)
         
-        m.get_root().html.add_child(folium.Element(dot_js))
-   
+        # Add the feature group to the map
+        dot_group.add_to(m)
+
     # Add sector circles if display mode includes sectors
-    if "Sectors" in display_mode and display_mode != "Dots Only":
+    if "Sectors" in display_mode:
+        # Calculate sector radius in meters (adjusted for map aesthetics)
+        sector_radius = 300
+        
         for sector_name, data in sectors_data.items():
             sector_info = next((s for s in islamabad["sectors"] if s["name"] == sector_name), None)
             if not sector_info:
@@ -320,52 +424,121 @@ def create_islamabad_map(sectors_data, infected_people, selected_day, dot_densit
             day_data = next((d for d in data["timeline"] if d["day"] == selected_day), None)
             if not day_data:
                 continue
+            
+            # Find active cases and recovered cases in this sector
+            active_cases = day_data["active_infections"]
+            total_cases = day_data["cumulative_infections"]
+            recovered_cases = total_cases - active_cases
            
             # Calculate infection percentage
-            infection_percent = (day_data["active_infections"] / sector_info["population"]) * 100
-           
-            # Determine color based on infection rate
-            if infection_percent > 5:
-                color = "darkred"
-            elif infection_percent > 1:
-                color = "orange"
-            elif infection_percent > 0.1:
-                color = "yellow"
-            else:
-                color = "green"
+            infection_percent = (active_cases / sector_info["population"]) * 100
            
             # Create popup with sector information
             popup_text = f"""
             <strong>{sector_name}</strong><br>
             Population: {sector_info['population']:,}<br>
-            Active Cases: {day_data['active_infections']:,} ({infection_percent:.2f}%)<br>
-            Total Infections: {day_data['cumulative_infections']:,}<br>
+            Active Cases: {active_cases:,} ({infection_percent:.2f}%)<br>
+            Recovered Cases: {recovered_cases:,}<br>
+            Total Infections: {total_cases:,}<br>
             New Cases Today: {day_data['daily_new_cases']:,}
             """
             
-            # Only add sector circles if not in "Labels Only" mode
+            # In "Light" mode, add a light circle to indicate sector boundary
             if display_mode != "Dots + Sectors (Labels Only)":
-                # Adjust opacity based on display mode
-                opacity = 0.05 if display_mode == "Dots + Sectors (Light)" else 0.3
-                
+                # Add a light boundary for the sector
                 folium.Circle(
                     location=[sector_info["lat"], sector_info["lon"]],
-                    radius=300,
-                    color=color,
+                    radius=sector_radius,
+                    color='gray',
                     fill=True,
-                    fill_opacity=opacity,
+                    fill_opacity=0.05,
+                    weight=1,
                     popup=folium.Popup(popup_text, max_width=250)
                 ).add_to(m)
-           
-            # Add sector label
+            
+            # Add sector label - modified for Labels Only mode to show infection counts
+            if display_mode == "Dots + Sectors (Labels Only)":
+                # For Labels Only, show the sector name and case count
+                html_content = f'''
+                <div style="font-size: 10pt; color: black; text-align: center;">
+                    <strong>{sector_name}</strong><br>
+                    {active_cases:,}
+                </div>
+                '''
+            else:
+                # For other modes, just show the sector name
+                html_content = f'''
+                <div style="font-size: 10pt; color: black; text-align: center;">
+                    <strong>{sector_name}</strong>
+                </div>
+                '''
+            
             folium.Marker(
                 location=[sector_info["lat"], sector_info["lon"]],
                 icon=folium.DivIcon(
                     icon_size=(150, 36),
                     icon_anchor=(75, 0),
-                    html=f'<div style="font-size: 10pt; color: black; text-align: center;">{sector_name}<br>{day_data["active_infections"]}</div>'
+                    html=html_content
                 )
             ).add_to(m)
+            
+            # NEW: Add representative dots within each sector circle
+            # Only for Sectors Only or Dots + Sectors (Light) modes, NOT for Labels Only
+            if display_mode != "Dots + Sectors (Labels Only)" and display_mode != "Dots Only":
+                # Calculate number of dots to show based on density
+                MAX_DOTS_PER_SECTOR = 100
+                active_dots_to_show = min(active_cases, MAX_DOTS_PER_SECTOR)
+                recovered_dots_to_show = min(recovered_cases, MAX_DOTS_PER_SECTOR)
+                
+                # Scale number of dots if there are too many cases
+                if active_cases + recovered_cases > MAX_DOTS_PER_SECTOR * 2:
+                    scale_factor = (MAX_DOTS_PER_SECTOR * 2) / (active_cases + recovered_cases)
+                    active_dots_to_show = int(active_cases * scale_factor)
+                    recovered_dots_to_show = int(recovered_cases * scale_factor)
+                
+                # Create a feature group for this sector's dots
+                sector_dots = folium.FeatureGroup(name=f"Sector {sector_name} Dots")
+                
+                # Generate positions for infected dots within the sector circle
+                for _ in range(active_dots_to_show):
+                    # Generate random point within sector circle - use seeded random
+                    angle = dot_random.uniform(0, 2 * 3.14159)
+                    radius_factor = dot_random.uniform(0, 0.9)  # Stay within 90% of circle radius
+                    offset_lat = radius_factor * sector_radius * 0.000009 * math.cos(angle)  # Convert meters to approx degrees
+                    offset_lon = radius_factor * sector_radius * 0.000015 * math.sin(angle)  # Adjust for latitude
+                    
+                    folium.CircleMarker(
+                        location=[sector_info["lat"] + offset_lat, sector_info["lon"] + offset_lon],
+                        radius=2,
+                        color='red',
+                        fill=True,
+                        fillColor='red',
+                        fillOpacity=0.8,
+                        weight=1,
+                        popup="Active Infection"
+                    ).add_to(sector_dots)
+                
+                # Generate positions for recovered dots
+                for _ in range(recovered_dots_to_show):
+                    # Generate random point within sector circle - use seeded random
+                    angle = dot_random.uniform(0, 2 * 3.14159)
+                    radius_factor = dot_random.uniform(0, 0.9)
+                    offset_lat = radius_factor * sector_radius * 0.000009 * math.cos(angle)
+                    offset_lon = radius_factor * sector_radius * 0.000015 * math.sin(angle)
+                    
+                    folium.CircleMarker(
+                        location=[sector_info["lat"] + offset_lat, sector_info["lon"] + offset_lon],
+                        radius=2,
+                        color='green',
+                        fill=True,
+                        fillColor='green',
+                        fillOpacity=0.8,
+                        weight=1,
+                        popup="Recovered Case"
+                    ).add_to(sector_dots)
+                
+                # Add the sector dots to the map
+                sector_dots.add_to(m)
    
     # Add title
     title_html = '''
@@ -380,6 +553,37 @@ def create_islamabad_map(sectors_data, infected_people, selected_day, dot_densit
     m.get_root().html.add_child(folium.Element(title_html))
    
     return m
+
+# Create a callback function to handle day changes
+def update_selected_day():
+    # Update the map key to force a refresh when day changes
+    st.session_state.map_key += 1
+
+# Animation toggle function
+def toggle_animation():
+    st.session_state.is_animating = not st.session_state.is_animating
+    if st.session_state.is_animating:
+        # If starting animation, make sure we're not at the end
+        if st.session_state.selected_day >= simulation_days:
+            st.session_state.selected_day = 0
+        st.session_state.map_key += 1
+    # Always rerun when toggling animation state
+    st.rerun()
+
+# Function to handle animation progression
+def handle_animation():
+    if st.session_state.is_animating:
+        # Increment the day
+        st.session_state.selected_day += 1
+        # Check if we reached the end
+        if st.session_state.selected_day >= simulation_days:
+            # Stop animation at the end
+            st.session_state.is_animating = False
+        else:
+            # Force map refresh
+            st.session_state.map_key += 1
+            # Schedule next update by rerunning
+            st.rerun()
 
 # Run simulation button
 if st.sidebar.button("Run Simulation"):
@@ -405,44 +609,88 @@ if st.sidebar.button("Run Simulation"):
         # Force a complete page refresh to ensure the map renders correctly
         st.rerun()
 
-# Create a single map that's less likely to cause rerendering issues
+# Update the map display section
 if st.session_state.simulation_run:
     # Create two columns for map and statistics
     col1, col2 = st.columns([3, 1])
    
     with col1:
-        # Day selector
-        selected_day = st.slider(
-            "Simulation Day",
-            0,
-            simulation_days,
-            st.session_state.get('selected_day', 0),
-            key="day_slider"
-        )
+        # Day control row with slider and animation buttons
+        day_col1, day_col2 = st.columns([3, 1])
         
-        # Store the selected day
-        st.session_state.selected_day = selected_day
+        with day_col1:
+            # Use Streamlit's on_change parameter to handle day changes properly
+            st.slider(
+                "Simulation Day",
+                0,
+                simulation_days,
+                value=st.session_state.selected_day,
+                key="day_slider_value",
+                on_change=update_selected_day,
+                disabled=st.session_state.is_animating  # Disable slider during animation
+            )
+            
+            # Make sure selected_day is updated from the slider value
+            if not st.session_state.is_animating:
+                st.session_state.selected_day = st.session_state.day_slider_value
         
-        # Create the map
+        with day_col2:
+            # Animation controls
+            animation_button_text = "⏹️ Stop" if st.session_state.is_animating else "▶️ Play"
+            animation_button_color = "secondary" if st.session_state.is_animating else "primary"
+            
+            # Prominent animation button
+            button_pressed = st.button(
+                animation_button_text,
+                key="animation_toggle",
+                type=animation_button_color,
+                use_container_width=True
+            )
+            
+            # Handle button press
+            if button_pressed:
+                toggle_animation()
+            
+            # Only show speed control when not animating
+            if not st.session_state.is_animating:
+                # Animation speed control - slower options
+                st.select_slider(
+                    "Speed",
+                    options=[1.0, 1.5, 2.0, 3.0, 4.0],
+                    value=st.session_state.animation_speed,
+                    key="animation_speed_slider",
+                    format_func=lambda x: f"{x}s"
+                )
+                
+                # Update animation speed from slider
+                st.session_state.animation_speed = st.session_state.animation_speed_slider
+            else:
+                # Show day counter during animation
+                st.markdown(f"**Day {st.session_state.selected_day}**")
+        
+        # Create and display the map
         current_map = create_islamabad_map(
             st.session_state.sectors_data,
             st.session_state.infected_people,
-            selected_day,
+            st.session_state.selected_day,
             st.session_state.dot_density,
             st.session_state.display_mode
         )
         
-        # Display the map
+        # Display the map with a stable key
         st_folium(
             current_map,
             width=800,
             height=600,
-            key=f"map_display_{selected_day}_{st.session_state.display_mode}_{st.session_state.dot_density}"
+            key=f"map_{st.session_state.map_key}"
         )
-   
+    
+    # IMPORTANT: Move the stats column here, OUTSIDE the col1 context
+    # This ensures the statistics are updated with each rerun    
     with col2:
-        # Display statistics
-        st.subheader(f"Day {selected_day} Statistics")
+        # Display statistics - use current selected_day
+        current_day = st.session_state.selected_day
+        st.subheader(f"Day {current_day} Statistics")
        
         # Calculate totals
         total_active = 0
@@ -450,7 +698,7 @@ if st.session_state.simulation_run:
         total_new_cases = 0
        
         for sector_name, data in st.session_state.sectors_data.items():
-            day_data = next((d for d in data["timeline"] if d["day"] == selected_day), None)
+            day_data = next((d for d in data["timeline"] if d["day"] == current_day), None)
             if day_data:
                 total_active += day_data["active_infections"]
                 total_cumulative += day_data["cumulative_infections"]
@@ -462,7 +710,7 @@ if st.session_state.simulation_run:
         st.metric("Total Infections", f"{total_cumulative:,}")
        
         # Show intervention status
-        if selected_day >= intervention_day:
+        if current_day >= intervention_day:
             st.info(f"Interventions active (reducing R by {intervention_strength*100:.0f}%)")
         else:
             st.warning(f"No interventions yet (starting day {intervention_day})")
@@ -476,7 +724,7 @@ if st.session_state.simulation_run:
             if st.button("Deploy Antidote"):
                 with st.spinner("Applying antidote..."):
                     st.session_state.antidote_applied = True
-                    st.session_state.antidote_day = selected_day
+                    st.session_state.antidote_day = st.session_state.selected_day
                     st.session_state.antidote_effectiveness = antidote_effectiveness
                    
                     # Re-run simulation with antidote
@@ -486,16 +734,15 @@ if st.session_state.simulation_run:
                         intervention_day,
                         intervention_strength,
                         True,
-                        selected_day,
+                        st.session_state.selected_day,
                         antidote_effectiveness
                     )
                    
                     st.session_state.sectors_data = sectors_data
                     st.session_state.infected_people = infected_people
-                    st.success(f"Antidote deployed on day {selected_day} with {antidote_effectiveness*100:.0f}% effectiveness!")
-                    
-                    # Force a complete page refresh
-                    st.experimental_rerun()
+                    st.session_state.map_key += 1  # Force map refresh
+                    st.success(f"Antidote deployed on day {st.session_state.selected_day} with {antidote_effectiveness*100:.0f}% effectiveness!")
+                    st.rerun()
         else:
             st.success(f"Antidote deployed on day {st.session_state.antidote_day} with {st.session_state.antidote_effectiveness*100:.0f}% effectiveness!")
        
@@ -505,7 +752,7 @@ if st.session_state.simulation_run:
        
         for sector_name, data in st.session_state.sectors_data.items():
             sector_info = next((s for s in islamabad["sectors"] if s["name"] == sector_name), None)
-            day_data = next((d for d in data["timeline"] if d["day"] == selected_day), None)
+            day_data = next((d for d in data["timeline"] if d["day"] == current_day), None)
            
             if sector_info and day_data:
                 infection_percent = (day_data["active_infections"] / sector_info["population"]) * 100
@@ -517,6 +764,13 @@ if st.session_state.simulation_run:
         # Display top 3
         for i, (sector, infected, percentage) in enumerate(sector_infections[:3]):
             st.write(f"{i+1}. {sector}: {infected:,} cases ({percentage:.2f}%)")
+    
+    # Move the animation handling AFTER both map and stats are displayed    
+    # Introduce artificial delay to control animation speed
+    if st.session_state.is_animating:
+        time.sleep(st.session_state.animation_speed)
+        # Proceed to next day after delay
+        handle_animation()
 else:
     # Instructions if simulation hasn't been run
     st.write("### Instructions")
@@ -527,4 +781,4 @@ else:
     st.write("5. Adjust dot density if you experience performance issues")
     st.write("6. Choose 'Dots Only' display mode to see infected individuals clearly")
    
-    st.info("This simulation shows infected individuals as red dots from day 0.")
+    st.info("This simulation shows infected individuals as red dots. Run the simulation to begin.")
